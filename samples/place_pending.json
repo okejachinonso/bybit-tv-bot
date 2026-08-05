@@ -1,0 +1,11 @@
+{
+  "secret": "replace_with_the_same_secret_in_your_pine_script",
+  "symbol": "BTCUSD",
+  "action": "place_pending",
+  "side": "buy",
+  "entry": 64000.0,
+  "stop": 63250.0,
+  "target": 67750.0,
+  "qty": 0.02,
+  "risk_usd": 25
+}

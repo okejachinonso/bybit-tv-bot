@@ -1,0 +1,6 @@
+{
+  "secret": "replace_with_the_same_secret_in_your_pine_script",
+  "symbol": "BTCUSD",
+  "action": "partial_close",
+  "side": "buy"
+}
