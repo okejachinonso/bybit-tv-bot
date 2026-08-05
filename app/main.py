@@ -331,7 +331,16 @@ def place_pending(client: BybitClient, symbol: str, payload: Dict[str, Any]) -> 
 def filled(client: BybitClient, symbol: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     stop = round_price(client, symbol, payload["stop"])
     target = round_price(client, symbol, payload["target"])
-    upsert_symbol_state(symbol, side=payload.get("side"), entry=payload.get("entry"), stop=float(stop), target=float(target), qty=payload.get("qty"), pending_order_id=None)
+    logging.info(f"Setting TP/SL: symbol={symbol} stop={stop} target={target}")
+    upsert_symbol_state(
+        symbol,
+        side=payload.get("side"),
+        entry=payload.get("entry"),
+        stop=float(stop),
+        target=float(target),
+        qty=payload.get("qty"),
+        pending_order_id=None,
+    )
     if DRY_RUN:
         return {"dry_run": True, "action": "filled", "symbol": symbol}
     return client.set_trading_stop(
