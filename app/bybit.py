@@ -40,6 +40,13 @@ def dstr(v: Any) -> str:
     return s or "0"
 
 
+def normalize_symbol(symbol: Any) -> str:
+    s = str(symbol or "").strip().upper()
+    if s.endswith(".P"):
+        s = s[:-2]
+    return s
+
+
 def round_to_step(value: Any, step: Any, rounding=ROUND_HALF_UP) -> Decimal:
     d_value = to_decimal(value)
     d_step = to_decimal(step)
@@ -122,6 +129,7 @@ class BybitClient:
         return data
 
     def get_ticker_price(self, symbol: str, category: str) -> Decimal:
+        symbol = normalize_symbol(symbol)
         cache_key = (category, symbol)
         cached = self._ticker_cache.get(cache_key)
         now = time.time()
@@ -141,6 +149,7 @@ class BybitClient:
         return d
 
     def get_instrument(self, symbol: str, category: str) -> Dict[str, Any]:
+        symbol = normalize_symbol(symbol)
         cache_key = (category, symbol)
         if cache_key in self._instrument_cache:
             return self._instrument_cache[cache_key]
@@ -153,6 +162,7 @@ class BybitClient:
         return item
 
     def get_position(self, symbol: str, category: str) -> Optional[Dict[str, Any]]:
+        symbol = normalize_symbol(symbol)
         data = self._request("GET", "/v5/position/list", params={"category": category, "symbol": symbol}, auth=True)
         items = data.get("result", {}).get("list", [])
         if not items:
@@ -163,6 +173,7 @@ class BybitClient:
         return items[0] if items else None
 
     def cancel_all_orders(self, symbol: str, category: str) -> Dict[str, Any]:
+        symbol = normalize_symbol(symbol)
         return self._request("POST", "/v5/order/cancel-all", body={"category": category, "symbol": symbol}, auth=True)
 
     def place_order(self, payload: Dict[str, Any]) -> Dict[str, Any]:
