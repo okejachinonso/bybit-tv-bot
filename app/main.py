@@ -152,6 +152,9 @@ def compact_json(payload: Dict[str, Any]) -> str:
 
 def normalize_symbol(symbol: str) -> str:
     sym = (symbol or "").strip().upper()
+    # TradingView perpetual futures symbols often arrive as SYMBOL.P; Bybit expects SYMBOL.
+    if sym.endswith(".P"):
+        sym = sym[:-2]
     if sym in SYMBOL_MAP:
         return SYMBOL_MAP[sym]
     if sym.endswith("USDT"):
