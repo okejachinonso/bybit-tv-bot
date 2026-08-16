@@ -77,10 +77,26 @@ def init_db() -> None:
                 target REAL,
                 qty REAL,
                 pending_order_id TEXT,
-                updated_at INTEGER NOT NULL
+                updated_at INTEGER NOT NULL,
+                state TEXT,
+                intended_qty REAL,
+                normalized_qty REAL,
+                pending_order_ids TEXT,
+                signal_fingerprint TEXT
             )
             """
         )
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(symbol_state)").fetchall()}
+        migrations = {
+            "state": "TEXT",
+            "intended_qty": "REAL",
+            "normalized_qty": "REAL",
+            "pending_order_ids": "TEXT",
+            "signal_fingerprint": "TEXT",
+        }
+        for name, typ in migrations.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE symbol_state ADD COLUMN {name} {typ}")
         conn.commit()
 
 
@@ -117,14 +133,25 @@ def upsert_symbol_state(symbol: str, **fields: Any) -> None:
         "qty": current.get("qty"),
         "pending_order_id": current.get("pending_order_id"),
         "updated_at": now,
+        "state": current.get("state"),
+        "intended_qty": current.get("intended_qty"),
+        "normalized_qty": current.get("normalized_qty"),
+        "pending_order_ids": current.get("pending_order_ids"),
+        "signal_fingerprint": current.get("signal_fingerprint"),
     }
     data.update({k: v for k, v in fields.items() if v is not None})
     data["updated_at"] = now
     with db() as conn:
         conn.execute(
             """
-            INSERT INTO symbol_state (symbol, side, entry, stop, target, qty, pending_order_id, updated_at)
-            VALUES (:symbol, :side, :entry, :stop, :target, :qty, :pending_order_id, :updated_at)
+            INSERT INTO symbol_state (
+                symbol, side, entry, stop, target, qty, pending_order_id, updated_at,
+                state, intended_qty, normalized_qty, pending_order_ids, signal_fingerprint
+            )
+            VALUES (
+                :symbol, :side, :entry, :stop, :target, :qty, :pending_order_id, :updated_at,
+                :state, :intended_qty, :normalized_qty, :pending_order_ids, :signal_fingerprint
+            )
             ON CONFLICT(symbol) DO UPDATE SET
                 side=excluded.side,
                 entry=excluded.entry,
@@ -132,7 +159,12 @@ def upsert_symbol_state(symbol: str, **fields: Any) -> None:
                 target=excluded.target,
                 qty=excluded.qty,
                 pending_order_id=excluded.pending_order_id,
-                updated_at=excluded.updated_at
+                updated_at=excluded.updated_at,
+                state=excluded.state,
+                intended_qty=excluded.intended_qty,
+                normalized_qty=excluded.normalized_qty,
+                pending_order_ids=excluded.pending_order_ids,
+                signal_fingerprint=excluded.signal_fingerprint
             """,
             data,
         )
@@ -233,6 +265,12 @@ def qty_step_from_instrument(info: Dict[str, Any]) -> Decimal:
     return to_decimal(lot.get("qtyStep") or "0.001")
 
 
+def max_market_qty_from_instrument(info: Dict[str, Any]) -> Decimal:
+    lot = info.get("lotSizeFilter", {}) or {}
+    value = lot.get("maxMktOrderQty") or lot.get("maxMarketOrderQty") or lot.get("maxOrderQty") or "0"
+    return to_decimal(value)
+
+
 def tick_size_from_instrument(info: Dict[str, Any]) -> Decimal:
     pf = info.get("priceFilter", {}) or {}
     return to_decimal(pf.get("tickSize") or "0.5")
@@ -271,7 +309,7 @@ def trigger_direction(entry_price: Decimal, current_price: Decimal) -> int:
     return 1 if entry_price > current_price else 2
 
 
-def build_order_link_id(action: str, payload: Dict[str, Any]) -> str:
+def build_order_link_id(action: str, payload: Dict[str, Any], suffix: str = "") -> str:
     base = compact_json(
         {
             "action": action,
@@ -282,6 +320,7 @@ def build_order_link_id(action: str, payload: Dict[str, Any]) -> str:
             "target": payload.get("target"),
             "qty": payload.get("qty"),
             "new_stop": payload.get("new_stop"),
+            "suffix": suffix,
         }
     )
     return f"tv_{sha12(base)}"
@@ -291,59 +330,214 @@ def current_position_qty(client: BybitClient, symbol: str) -> Decimal:
     pos = client.get_position(symbol, BYBIT_CATEGORY)
     return to_decimal(pos.get("size")) if pos else Decimal("0")
 
+def _cancel_specific_orders(client: BybitClient, symbol: str, order_ids: list[str]) -> None:
+    for order_id in order_ids:
+        try:
+            client.cancel_order(symbol, BYBIT_CATEGORY, order_id=order_id)
+        except Exception as exc:
+            log.warning("Unable to cancel child order %s for %s: %s", order_id, symbol, exc)
+
 # -----------------------------------------------------------------------------
 # Trading actions
 # -----------------------------------------------------------------------------
 
+def _validate_stop_order_geometry(side: str, entry: Decimal, current_price: Decimal) -> None:
+    # Pine uses strategy.entry(..., stop=entry), so a valid long stop must be above
+    # current price and a valid short stop must be below current price. Do not turn
+    # a stale signal into the opposite-style conditional order.
+    if side == "Buy" and entry <= current_price:
+        raise BybitError(f"Stale/invalid BUY stop: entry={dstr(entry)} current={dstr(current_price)}")
+    if side == "Sell" and entry >= current_price:
+        raise BybitError(f"Stale/invalid SELL stop: entry={dstr(entry)} current={dstr(current_price)}")
+
+
+def _split_qty(qty: Decimal, max_qty: Decimal, step: Decimal) -> list[Decimal]:
+    if qty <= 0:
+        return []
+    if max_qty <= 0:
+        return [qty]
+    chunk = floor_to_step(max_qty, step) if step > 0 else max_qty
+    if chunk <= 0:
+        raise BybitError(f"Invalid Bybit max market quantity {dstr(max_qty)}")
+    parts: list[Decimal] = []
+    remaining = qty
+    while remaining > 0:
+        part = chunk if remaining > chunk else remaining
+        if step > 0:
+            part = floor_to_step(part, step)
+        if part <= 0:
+            raise BybitError(f"Unable to split quantity {dstr(qty)} using step {dstr(step)}")
+        parts.append(part)
+        remaining -= part
+    return parts
+
+
 def place_pending(client: BybitClient, symbol: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    state = get_symbol_state(symbol) or {}
+    signal_fp = fingerprint_event(payload)
+    if state.get("signal_fingerprint") == signal_fp and state.get("state") == "PENDING" and state.get("pending_order_ids"):
+        existing_ids = json.loads(state["pending_order_ids"]) if state.get("pending_order_ids") else []
+        return {"ok": True, "reused": True, "order_ids": existing_ids, "intended_qty": state.get("intended_qty")}
+
     entry = round_price(client, symbol, payload["entry"])
     stop = round_price(client, symbol, payload["stop"])
     target = round_price(client, symbol, payload["target"])
-    qty = round_qty(client, symbol, payload["qty"])
+    intended_qty = to_decimal(payload["qty"])
+    intended_risk = to_decimal(payload.get("risk_usd", "0"))
+
+    # Re-derive the risk-sized quantity from the actual prices that will be sent
+    # to Bybit. TradingView already formats to mintick, but this final check makes
+    # the bridge authoritative and prevents tick rounding from increasing risk.
+    risk_per_unit = abs(entry - stop)
+    if risk_per_unit <= 0:
+        raise BybitError(f"Invalid risk distance for {symbol}: entry={dstr(entry)} stop={dstr(stop)}")
+    risk_sized_qty = intended_risk / risk_per_unit if intended_risk > 0 else intended_qty
+    if intended_qty > 0:
+        relative_diff = abs(risk_sized_qty - intended_qty) / intended_qty
+        if relative_diff > Decimal("0.005"):
+            raise BybitError(
+                f"TradingView qty/risk mismatch for {symbol}: payload_qty={dstr(intended_qty)} "
+                f"risk_sized_qty={dstr(risk_sized_qty)} entry={dstr(entry)} stop={dstr(stop)}"
+            )
+    intended_qty = risk_sized_qty
+    qty = round_qty(client, symbol, intended_qty)
     qty = ensure_min_qty(client, symbol, qty)
     if qty <= 0:
-        raise BybitError(f"Qty too small after rounding for {symbol}")
+        raise BybitError(f"Qty too small after rounding for {symbol}: requested={dstr(intended_qty)}")
+
+    info = instrument_info(client, symbol)
+    step = qty_step_from_instrument(info)
+    max_mkt_qty = max_market_qty_from_instrument(info)
+    if max_mkt_qty <= 0:
+        raise BybitError(f"Bybit did not return a usable max market quantity for {symbol}")
 
     current_price = client.get_ticker_price(symbol, BYBIT_CATEGORY)
-    order = {
-        "category": BYBIT_CATEGORY,
-        "symbol": symbol,
-        "side": normalize_side(payload["side"]),
-        "orderType": "Market",
-        "qty": dstr(qty),
-        "triggerPrice": dstr(entry),
-        "triggerDirection": trigger_direction(entry, current_price),
-        "triggerBy": "LastPrice",
-        "reduceOnly": False,
-        "closeOnTrigger": False,
-        "positionIdx": POSITION_IDX,
-        "takeProfit": dstr(target),
-        "stopLoss": dstr(stop),
-        "orderLinkId": build_order_link_id("place_pending", {**payload, "symbol": symbol}),
+    side = normalize_side(payload["side"])
+    _validate_stop_order_geometry(side, entry, current_price)
+
+    chunks = _split_qty(qty, max_mkt_qty, step)
+    actual_qty = sum(chunks, Decimal("0"))
+    actual_risk = risk_per_unit * actual_qty
+    if intended_risk > 0 and actual_risk > intended_risk * Decimal("1.0000001"):
+        raise BybitError(
+            f"Risk validation failed for {symbol}: intended=${dstr(intended_risk)} actual=${dstr(actual_risk)}"
+        )
+
+    order_ids: list[str] = []
+    orders: list[dict[str, Any]] = []
+    for idx, chunk in enumerate(chunks, start=1):
+        order_link_id = build_order_link_id(
+            "place_pending",
+            {**payload, "symbol": symbol},
+            suffix=str(idx),
+        )
+        order = {
+            "category": BYBIT_CATEGORY,
+            "symbol": symbol,
+            "side": side,
+            "orderType": "Market",
+            "qty": dstr(chunk),
+            "triggerPrice": dstr(entry),
+            "triggerDirection": 1 if entry > current_price else 2,
+            "triggerBy": "LastPrice",
+            "reduceOnly": False,
+            "closeOnTrigger": False,
+            "positionIdx": POSITION_IDX,
+            "takeProfit": dstr(target),
+            "stopLoss": dstr(stop),
+            "orderLinkId": order_link_id,
+        }
+        orders.append(order)
+
+        if DRY_RUN:
+            order_ids.append(order_link_id)
+            continue
+
+        try:
+            result = client.place_order(order)
+        except Exception:
+            # If a later chunk fails, immediately cancel all pending orders for the
+            # symbol so we do not leave a partial live entry behind.
+            if order_ids:
+                _cancel_specific_orders(client, symbol, order_ids)
+            raise
+        order_id = ((result.get("result") or {}).get("orderId") if isinstance(result, dict) else None) or order_link_id
+        order_ids.append(order_id)
+
+    pending_json = json.dumps(order_ids, separators=(",", ":"))
+    upsert_symbol_state(
+        symbol,
+        side=side,
+        entry=float(entry),
+        stop=float(stop),
+        target=float(target),
+        qty=float(actual_qty),
+        pending_order_id=order_ids[0] if order_ids else None,
+        state="PENDING",
+        intended_qty=float(intended_qty),
+        normalized_qty=float(actual_qty),
+        pending_order_ids=pending_json,
+        signal_fingerprint=signal_fp,
+    )
+
+    return {
+        "ok": True,
+        "order_ids": order_ids,
+        "chunks": [dstr(x) for x in chunks],
+        "intended_qty": dstr(intended_qty),
+        "normalized_qty": dstr(actual_qty),
+        "max_market_qty": dstr(max_mkt_qty),
+        "current_price": dstr(current_price),
+        "entry": dstr(entry),
+        "stop": dstr(stop),
+        "target": dstr(target),
+        "risk_usd": dstr(actual_risk),
+        "order_count": len(order_ids),
+        "orders": orders if DRY_RUN else None,
+        "dry_run": DRY_RUN,
     }
 
-    upsert_symbol_state(symbol, side=payload.get("side"), entry=float(entry), stop=float(stop), target=float(target), qty=float(qty), pending_order_id=order["orderLinkId"])
-    if DRY_RUN:
-        return {"dry_run": True, "order": order}
-    return client.place_order(order)
+def _position_with_retry(client: BybitClient, symbol: str, attempts: int = 5, delay_seconds: float = 0.75) -> Optional[dict]:
+    last = None
+    for attempt in range(attempts):
+        last = client.get_position(symbol, BYBIT_CATEGORY)
+        if last and to_decimal(last.get("size")) > 0:
+            return last
+        if attempt + 1 < attempts:
+            time.sleep(delay_seconds)
+    return last
 
 
 def filled(client: BybitClient, symbol: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     stop = round_price(client, symbol, payload["stop"])
     target = round_price(client, symbol, payload["target"])
-    logging.info(f"Setting TP/SL: symbol={symbol} stop={stop} target={target}")
-    upsert_symbol_state(
-        symbol,
-        side=payload.get("side"),
-        entry=payload.get("entry"),
-        stop=float(stop),
-        target=float(target),
-        qty=payload.get("qty"),
-        pending_order_id=None,
-    )
+
     if DRY_RUN:
+        upsert_symbol_state(
+            symbol, side=payload.get("side"), entry=payload.get("entry"), stop=float(stop),
+            target=float(target), qty=payload.get("qty"), pending_order_id=None,
+            state="FILLED", pending_order_ids="[]", signal_fingerprint=None,
+        )
         return {"dry_run": True, "action": "filled", "symbol": symbol}
-    return client.set_trading_stop(
+
+    pos = _position_with_retry(client, symbol)
+    if not pos or to_decimal(pos.get("size")) <= 0:
+        log.error("TradingView reported FILLED but Bybit shows no position for %s; refusing to set TP/SL", symbol)
+        upsert_symbol_state(
+            symbol, side=payload.get("side"), entry=payload.get("entry"), stop=float(stop),
+            target=float(target), qty=payload.get("qty"), state="RECONCILE_NEEDED",
+        )
+        return {"ok": False, "reconciliation_needed": True, "message": f"No Bybit position for {symbol}; TP/SL not sent"}
+
+    actual_size = to_decimal(pos.get("size"))
+    actual_side = pos.get("side") or payload.get("side")
+    upsert_symbol_state(
+        symbol, side=actual_side, entry=payload.get("entry"), stop=float(stop), target=float(target),
+        qty=float(actual_size), pending_order_id="", state="PROTECTED",
+        normalized_qty=float(actual_size), pending_order_ids="[]", signal_fingerprint="",
+    )
+
+    result = client.set_trading_stop(
         {
             "category": BYBIT_CATEGORY,
             "symbol": symbol,
@@ -353,6 +547,7 @@ def filled(client: BybitClient, symbol: str, payload: Dict[str, Any]) -> Dict[st
             "takeProfit": dstr(target),
         }
     )
+    return {"ok": True, "position_size": dstr(actual_size), "side": actual_side, "result": result}
 
 
 def move_stop(client: BybitClient, symbol: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -362,6 +557,12 @@ def move_stop(client: BybitClient, symbol: str, payload: Dict[str, Any]) -> Dict
     tp = to_decimal(existing_target) if existing_target is not None else None
     if DRY_RUN:
         return {"dry_run": True, "action": "move_stop", "symbol": symbol, "new_stop": dstr(new_stop), "target": dstr(tp) if tp is not None else None}
+
+    pos = client.get_position(symbol, BYBIT_CATEGORY)
+    if not pos or to_decimal(pos.get("size")) <= 0:
+        log.warning("Ignoring move_stop for %s because Bybit reports zero position", symbol)
+        return {"ok": True, "ignored": "no_position", "symbol": symbol}
+
     body = {
         "category": BYBIT_CATEGORY,
         "symbol": symbol,
@@ -371,8 +572,10 @@ def move_stop(client: BybitClient, symbol: str, payload: Dict[str, Any]) -> Dict
     }
     if tp is not None and tp != 0:
         body["takeProfit"] = dstr(tp)
-    return client.set_trading_stop(body)
 
+    result = client.set_trading_stop(body)
+    upsert_symbol_state(symbol, stop=float(new_stop), state="MANAGING", qty=float(to_decimal(pos.get("size"))))
+    return {"ok": True, "position_size": dstr(to_decimal(pos.get("size"))), "result": result}
 
 def partial_close(client: BybitClient, symbol: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     percent = to_decimal(payload.get("percent", PARTIAL_CLOSE_PCT))
@@ -400,7 +603,9 @@ def partial_close(client: BybitClient, symbol: str, payload: Dict[str, Any]) -> 
     }
     if DRY_RUN:
         return {"dry_run": True, "action": "partial_close", "symbol": symbol, "qty": dstr(qty)}
-    return client.place_order(order)
+    result = client.place_order(order)
+    upsert_symbol_state(symbol, state="MANAGING", qty=float(size))
+    return result
 
 
 def close_position(client: BybitClient, symbol: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -410,10 +615,13 @@ def close_position(client: BybitClient, symbol: str, payload: Dict[str, Any]) ->
     size = to_decimal(pos.get("size"))
     side = pos.get("side", payload.get("side", "Buy"))
     if CANCEL_ALL_ON_CLOSE:
+        state = get_symbol_state(symbol) or {}
         try:
-            client.cancel_all_orders(symbol, BYBIT_CATEGORY)
-        except Exception as exc:
-            log.warning("cancel-all on close failed for %s: %s", symbol, exc)
+            order_ids = json.loads(state.get("pending_order_ids") or "[]")
+        except Exception:
+            order_ids = []
+        if order_ids:
+            _cancel_specific_orders(client, symbol, order_ids)
     order = {
         "category": BYBIT_CATEGORY,
         "symbol": symbol,
@@ -426,13 +634,23 @@ def close_position(client: BybitClient, symbol: str, payload: Dict[str, Any]) ->
     }
     if DRY_RUN:
         return {"dry_run": True, "action": "close", "symbol": symbol, "qty": dstr(size), "side": side}
-    return client.place_order(order)
+    result = client.place_order(order)
+    upsert_symbol_state(symbol, state="CLOSE_REQUESTED", pending_order_id="", pending_order_ids="[]")
+    return result
 
 
 def cancel_pending(client: BybitClient, symbol: str) -> Dict[str, Any]:
+    state = get_symbol_state(symbol) or {}
+    raw_ids = state.get("pending_order_ids") or "[]"
+    try:
+        order_ids = json.loads(raw_ids)
+    except Exception:
+        order_ids = []
     if DRY_RUN:
-        return {"dry_run": True, "action": "cancel_pending", "symbol": symbol}
-    return client.cancel_all_orders(symbol, BYBIT_CATEGORY)
+        return {"dry_run": True, "action": "cancel_pending", "symbol": symbol, "order_ids": order_ids}
+    _cancel_specific_orders(client, symbol, order_ids)
+    upsert_symbol_state(symbol, pending_order_id="", pending_order_ids="[]", state="CANCELLED")
+    return {"ok": True, "cancelled_order_ids": order_ids}
 
 
 def action_router(client: BybitClient, payload: Dict[str, Any], symbol: str) -> Dict[str, Any]:
@@ -505,6 +723,8 @@ async def webhook(request: Request):
     if payload is None:
         return JSONResponse({"ok": True, "ignored": "non_json_payload"}, status_code=200)
 
+    action = normalize_action(payload.get("action", ""))
+    payload["action"] = action
     fingerprint = fingerprint_event(payload)
     if seen_recent(fingerprint):
         return JSONResponse({"ok": True, "ignored": "duplicate", "fingerprint": fingerprint}, status_code=200)
@@ -537,16 +757,8 @@ async def webhook(request: Request):
         log.exception("Webhook error payload=%s", payload)
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
-    if payload.get("action") in {"place_pending", "filled", "move_stop"}:
-        upsert_symbol_state(
-            symbol,
-            side=payload.get("side"),
-            entry=payload.get("entry"),
-            stop=payload.get("stop"),
-            target=payload.get("target"),
-            qty=payload.get("qty"),
-            pending_order_id=get_symbol_state(symbol).get("pending_order_id") if get_symbol_state(symbol) else None,
-        )
+    # Action handlers own state transitions. Do not overwrite their authoritative
+    # state here with the raw TradingView payload (especially after a failed order).
 
     return JSONResponse(
         {

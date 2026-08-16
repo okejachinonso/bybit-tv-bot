@@ -124,8 +124,14 @@ class BybitClient:
         except Exception as exc:
             raise BybitError(f"Non-JSON response from Bybit (HTTP {resp.status_code}): {resp.text[:500]}") from exc
 
-        if data.get("retCode") not in (0, "0", None):
-            raise BybitError(f"Bybit retCode={data.get('retCode')} retMsg={data.get('retMsg')} data={data}")
+        ret_code = data.get("retCode")
+        if ret_code not in (0, "0", None):
+            # Bybit 34040 means the requested TP/SL values are already in place.
+            # Treat it as a successful no-op instead of turning a harmless retry
+            # into a webhook 500.
+            if str(ret_code) == "34040":
+                return data
+            raise BybitError(f"Bybit retCode={ret_code} retMsg={data.get('retMsg')} data={data}")
         return data
 
     def get_ticker_price(self, symbol: str, category: str) -> Decimal:
@@ -171,6 +177,17 @@ class BybitClient:
             if to_decimal(item.get("size")) != 0:
                 return item
         return items[0] if items else None
+
+    def cancel_order(self, symbol: str, category: str, *, order_id: Optional[str] = None, order_link_id: Optional[str] = None) -> Dict[str, Any]:
+        symbol = normalize_symbol(symbol)
+        body: Dict[str, Any] = {"category": category, "symbol": symbol}
+        if order_id:
+            body["orderId"] = order_id
+        elif order_link_id:
+            body["orderLinkId"] = order_link_id
+        else:
+            raise BybitError("cancel_order requires order_id or order_link_id")
+        return self._request("POST", "/v5/order/cancel", body=body, auth=True)
 
     def cancel_all_orders(self, symbol: str, category: str) -> Dict[str, Any]:
         symbol = normalize_symbol(symbol)
