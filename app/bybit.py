@@ -178,6 +178,16 @@ class BybitClient:
                 return item
         return items[0] if items else None
 
+    def get_open_orders(self, symbol: str, category: str) -> list[Dict[str, Any]]:
+        symbol = normalize_symbol(symbol)
+        data = self._request(
+            "GET",
+            "/v5/order/realtime",
+            params={"category": category, "symbol": symbol, "orderStatus": "New"},
+            auth=True,
+        )
+        return data.get("result", {}).get("list", []) or []
+
     def cancel_order(self, symbol: str, category: str, *, order_id: Optional[str] = None, order_link_id: Optional[str] = None) -> Dict[str, Any]:
         symbol = normalize_symbol(symbol)
         body: Dict[str, Any] = {"category": category, "symbol": symbol}

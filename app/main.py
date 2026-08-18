@@ -4,6 +4,7 @@ import logging
 import os
 import sqlite3
 import time
+import threading
 from pathlib import Path
 from typing import Any, Dict, Optional
 from decimal import Decimal, ROUND_HALF_UP
@@ -40,6 +41,7 @@ REQUEST_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "15"))
 CANCEL_ALL_ON_CLOSE = os.getenv("CANCEL_ALL_ON_CLOSE", "true").lower() in {"1", "true", "yes", "y", "on"}
 CANCEL_ALL_ON_CANCEL_PENDING = os.getenv("CANCEL_ALL_ON_CANCEL_PENDING", "true").lower() in {"1", "true", "yes", "y", "on"}
 ROUND_PRICES_TO_TICK = os.getenv("ROUND_PRICES_TO_TICK", "true").lower() in {"1", "true", "yes", "y", "on"}
+ALLOW_ADD_TO_POSITION = os.getenv("ALLOW_ADD_TO_POSITION", "false").lower() in {"1", "true", "yes", "y", "on"}
 
 SYMBOL_MAP_RAW = os.getenv("SYMBOL_MAP_JSON", "{}").strip()
 try:
@@ -330,16 +332,79 @@ def current_position_qty(client: BybitClient, symbol: str) -> Decimal:
     pos = client.get_position(symbol, BYBIT_CATEGORY)
     return to_decimal(pos.get("size")) if pos else Decimal("0")
 
-def _cancel_specific_orders(client: BybitClient, symbol: str, order_ids: list[str]) -> None:
+def _cancel_specific_orders(client: BybitClient, symbol: str, order_ids: list[str]) -> list[str]:
+    failures: list[str] = []
     for order_id in order_ids:
         try:
             client.cancel_order(symbol, BYBIT_CATEGORY, order_id=order_id)
         except Exception as exc:
+            failures.append(str(order_id))
             log.warning("Unable to cancel child order %s for %s: %s", order_id, symbol, exc)
+    return failures
 
 # -----------------------------------------------------------------------------
 # Trading actions
 # -----------------------------------------------------------------------------
+
+# Serialize lifecycle operations per symbol so two near-simultaneous TradingView
+# webhooks cannot both observe the same old pending state and create duplicate
+# entries. A single-process Uvicorn deployment is assumed (the existing bot
+# deployment uses one worker).
+_symbol_locks: Dict[str, threading.RLock] = {}
+_symbol_locks_guard = threading.Lock()
+
+def _symbol_lock(symbol: str) -> threading.RLock:
+    key = normalize_symbol(symbol)
+    with _symbol_locks_guard:
+        lock = _symbol_locks.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _symbol_locks[key] = lock
+        return lock
+
+
+def _state_pending_ids(state: Dict[str, Any]) -> list[str]:
+    raw = state.get("pending_order_ids") or "[]"
+    try:
+        ids = json.loads(raw)
+    except Exception:
+        ids = []
+    if not isinstance(ids, list):
+        return []
+    return [str(x) for x in ids if x]
+
+
+def _cancel_bot_working_orders(client: BybitClient, symbol: str) -> tuple[list[str], list[str]]:
+    """Cancel all working orders created by this bot for a symbol.
+
+    We use the tv_ orderLinkId prefix so we do not cancel unrelated/manual
+    orders on the same symbol. Returns (cancelled_ids, failed_ids).
+
+    Failing to enumerate open orders is treated as a hard failure: placing a
+    replacement without knowing whether an old order is still live would defeat
+    the protection this function is meant to provide.
+    """
+    try:
+        working = client.get_open_orders(symbol, BYBIT_CATEGORY)
+    except Exception as exc:
+        raise BybitError(f"Unable to verify working bot orders for {symbol}: {exc}") from exc
+
+    bot_ids: list[str] = []
+    for item in working:
+        oid = str(item.get("orderId") or "").strip()
+        link_id = str(item.get("orderLinkId") or "").strip()
+        if oid and link_id.startswith("tv_"):
+            bot_ids.append(oid)
+
+    if not bot_ids:
+        return [], []
+
+    bot_ids = list(dict.fromkeys(bot_ids))
+    failures = _cancel_specific_orders(client, symbol, bot_ids)
+    failed_set = set(failures)
+    cancelled = [oid for oid in bot_ids if oid not in failed_set]
+    return cancelled, failures
+
 
 def _validate_stop_order_geometry(side: str, entry: Decimal, current_price: Decimal) -> None:
     # Pine uses strategy.entry(..., stop=entry), so a valid long stop must be above
@@ -372,12 +437,36 @@ def _split_qty(qty: Decimal, max_qty: Decimal, step: Decimal) -> list[Decimal]:
     return parts
 
 
-def place_pending(client: BybitClient, symbol: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+def _place_pending_locked(client: BybitClient, symbol: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     state = get_symbol_state(symbol) or {}
     signal_fp = fingerprint_event(payload)
     if state.get("signal_fingerprint") == signal_fp and state.get("state") == "PENDING" and state.get("pending_order_ids"):
-        existing_ids = json.loads(state["pending_order_ids"]) if state.get("pending_order_ids") else []
+        existing_ids = _state_pending_ids(state)
         return {"ok": True, "reused": True, "order_ids": existing_ids, "intended_qty": state.get("intended_qty")}
+
+    # This strategy is one-entry-at-a-time. A new pending signal must replace
+    # the previous pending order, never stack another risk unit on top of it.
+    # This also protects against a race where an entry has already filled but
+    # the TradingView "filled" webhook has not reached us yet.
+    existing_position_qty = current_position_qty(client, symbol)
+    if existing_position_qty > 0 and not ALLOW_ADD_TO_POSITION:
+        raise BybitError(
+            f"Refusing new {symbol} entry: existing Bybit position size={dstr(existing_position_qty)}; "
+            "close/reconcile the current position before placing another entry"
+        )
+
+    # Cancel BOTH the IDs remembered in SQLite and any other currently-working
+    # bot orders on this symbol. The latter closes the gap caused by older bot
+    # versions overwriting pending_order_ids and forgetting earlier orders.
+    cancelled_ids, orphan_failures = _cancel_bot_working_orders(client, symbol)
+    if orphan_failures:
+        upsert_symbol_state(symbol, pending_order_ids="[]", pending_order_id="", state="CANCEL_FAILED")
+        raise BybitError(f"Unable to cancel existing bot order(s) for {symbol}: {orphan_failures}")
+
+    # The open-order query is authoritative. SQLite state is bookkeeping only,
+    # because older bot versions could overwrite pending_order_ids and forget
+    # previously-created orders.
+    upsert_symbol_state(symbol, pending_order_ids="[]", pending_order_id="", state="REPLACING")
 
     entry = round_price(client, symbol, payload["entry"])
     stop = round_price(client, symbol, payload["stop"])
@@ -494,8 +583,15 @@ def place_pending(client: BybitClient, symbol: str, payload: Dict[str, Any]) -> 
         "risk_usd": dstr(actual_risk),
         "order_count": len(order_ids),
         "orders": orders if DRY_RUN else None,
+        "cancelled_previous_order_ids": cancelled_ids,
         "dry_run": DRY_RUN,
     }
+
+
+def place_pending(client: BybitClient, symbol: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    with _symbol_lock(symbol):
+        return _place_pending_locked(client, symbol, payload)
+
 
 def _position_with_retry(client: BybitClient, symbol: str, attempts: int = 5, delay_seconds: float = 0.75) -> Optional[dict]:
     last = None
@@ -639,18 +735,33 @@ def close_position(client: BybitClient, symbol: str, payload: Dict[str, Any]) ->
     return result
 
 
-def cancel_pending(client: BybitClient, symbol: str) -> Dict[str, Any]:
+def _cancel_pending_locked(client: BybitClient, symbol: str) -> Dict[str, Any]:
     state = get_symbol_state(symbol) or {}
-    raw_ids = state.get("pending_order_ids") or "[]"
-    try:
-        order_ids = json.loads(raw_ids)
-    except Exception:
-        order_ids = []
+    order_ids = _state_pending_ids(state)
     if DRY_RUN:
         return {"dry_run": True, "action": "cancel_pending", "symbol": symbol, "order_ids": order_ids}
-    _cancel_specific_orders(client, symbol, order_ids)
+
+    failures: list[str] = []
+    if order_ids:
+        failures.extend(_cancel_specific_orders(client, symbol, order_ids))
+
+    # Also clear any orphaned bot orders that an older state record no longer
+    # remembers. We intentionally filter by tv_ orderLinkId to preserve manual
+    # or unrelated strategy orders.
+    _, orphan_failures = _cancel_bot_working_orders(client, symbol)
+    failures.extend(orphan_failures)
+
+    if failures:
+        upsert_symbol_state(symbol, pending_order_id="", pending_order_ids="[]", state="CANCEL_FAILED")
+        raise BybitError(f"Unable to cancel pending order(s) for {symbol}: {failures}")
+
     upsert_symbol_state(symbol, pending_order_id="", pending_order_ids="[]", state="CANCELLED")
     return {"ok": True, "cancelled_order_ids": order_ids}
+
+
+def cancel_pending(client: BybitClient, symbol: str) -> Dict[str, Any]:
+    with _symbol_lock(symbol):
+        return _cancel_pending_locked(client, symbol)
 
 
 def action_router(client: BybitClient, payload: Dict[str, Any], symbol: str) -> Dict[str, Any]:
@@ -673,7 +784,7 @@ def action_router(client: BybitClient, payload: Dict[str, Any], symbol: str) -> 
 # App
 # -----------------------------------------------------------------------------
 
-app = FastAPI(title="TradingView → Bybit Demo Bot", version="2.0.0")
+app = FastAPI(title="TradingView → Bybit Demo Bot", version="2.1.0")
 client = get_client()
 
 
